@@ -26,14 +26,36 @@ def parse_date_from_line(line: str):
 
 def clean_name(raw: str) -> str:
     """
-    Fixes cases like '. ALEJANDRO P' or '• ALEJANDRO P' by removing leading junk.
-    Keeps only A-Z, spaces, apostrophes, hyphens, dots INSIDE names.
+    Converts coverage labels like:
+      '024 - PAINT PAUL G'  -> 'PAUL G'
+      '021 - CONSTRUCTION BRIAN C' -> 'BRIAN C'
+    Also fixes leading bullets/dots like '. ALEJANDRO P' -> 'ALEJANDRO P'
     """
     s = raw.upper().strip()
-    # remove leading non-letters (., •, -, digits, etc.)
-    s = re.sub(r"^[^A-Z]+", "", s)
-    # collapse whitespace
+
+    # Remove leading junk (bullets/dots/etc.)
+    s = re.sub(r"^[^A-Z0-9]+", "", s)
+
+    # Remove leading code like "024 - "
+    s = re.sub(r"^\d+\s*-\s*", "", s)
+
+    # Collapse spaces
     s = " ".join(s.split())
+
+    # If it ends with an initial (single letter), keep "FIRST INITIAL" from the end
+    parts = s.split()
+    if len(parts) >= 2 and re.fullmatch(r"[A-Z]", parts[-1]):
+        # keep last 2 tokens (e.g., PAUL G)
+        return f"{parts[-2]} {parts[-1]}"
+
+    # If it ends with 2 initials (rare), keep last 3 tokens (e.g., MARY A B)
+    if len(parts) >= 3 and re.fullmatch(r"[A-Z]", parts[-1]) and re.fullmatch(r"[A-Z]", parts[-2]):
+        return f"{parts[-3]} {parts[-2]} {parts[-1]}"
+
+    # Fallback: keep last token(s) if no initial was found (not ideal but better than dept)
+    if len(parts) >= 1:
+        return parts[-1]
+
     return s
 
 @st.cache_data(show_spinner=False)
