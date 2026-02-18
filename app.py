@@ -8,25 +8,33 @@ import streamlit as st
 
 st.set_page_config(page_title="Shift Overlap Finder", layout="centered")
 
-# Find a date anywhere in the line, even if it has extra junk after it
+# Finds a date anywhere on the line (PDF often has extra text)
 DATE_ANYWHERE_RE = re.compile(
     r"(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s+"
     r"([A-Za-z]+)\s+(\d{1,2}),\s+(\d{4})"
 )
 
-# FIRST time-range token on the line = the real SHIFT (ignore meal/skills after)
+# First time-range token on the line = MAIN SHIFT (ignore meal/skills later)
 SHIFT_TOKEN_RE = re.compile(r"\+?\d{1,2}:\d{2}[AP]M-\d{1,2}:\d{2}[AP]M\+?")
-
-def norm_name(s: str) -> str:
-    return " ".join(s.upper().split())
 
 def parse_date_from_line(line: str):
     m = DATE_ANYWHERE_RE.search(line)
     if not m:
         return None
-    # Rebuild a clean date string for strptime
     clean = f"{m.group(1)}, {m.group(2)} {m.group(3)}, {m.group(4)}"
     return datetime.strptime(clean, "%A, %B %d, %Y").date()
+
+def clean_name(raw: str) -> str:
+    """
+    Fixes cases like '. ALEJANDRO P' or '• ALEJANDRO P' by removing leading junk.
+    Keeps only A-Z, spaces, apostrophes, hyphens, dots INSIDE names.
+    """
+    s = raw.upper().strip()
+    # remove leading non-letters (., •, -, digits, etc.)
+    s = re.sub(r"^[^A-Z]+", "", s)
+    # collapse whitespace
+    s = " ".join(s.split())
+    return s
 
 @st.cache_data(show_spinner=False)
 def parse_pdf(file_bytes: bytes) -> pd.DataFrame:
@@ -41,7 +49,6 @@ def parse_pdf(file_bytes: bytes) -> pd.DataFrame:
                 if not line:
                     continue
 
-                # Update current_date if a date appears on this line (even with extra text)
                 d = parse_date_from_line(line)
                 if d:
                     current_date = d
@@ -50,74 +57,93 @@ def parse_pdf(file_bytes: bytes) -> pd.DataFrame:
                 if not current_date:
                     continue
 
-                # Find the FIRST shift token (main shift). Ignore meal/skills later in the line.
                 mshift = SHIFT_TOKEN_RE.search(line)
                 if not mshift:
                     continue
 
+                # MAIN shift = first token only
                 shift = mshift.group(0).replace("+", "")
                 start_s, end_s = shift.split("-")
 
-                # Name = everything before first shift token
                 name_raw = line[:mshift.start()].strip()
-                if not name_raw:
+                name = clean_name(name_raw)
+                if not name:
                     continue
-                name = norm_name(name_raw)
 
-                # Skip common non-people headers/sections
-                bad_starts = (
-                    "NAME SHIFT", "ASSOCIATE", "SPECIALIST", "RECOVERY", "WATERING",
-                    "ACTIVITIES", "TOTAL HOURS", "FCST:", "SCH:", "O/U:", "SVF%", "TIME PERIOD", "QUERY :", "PAGE"
+                # skip obvious non-people headings
+                bad_prefix = (
+                    "NAME", "SHIFT", "TOTAL", "TIME PERIOD", "QUERY", "PAGE",
+                    "FCST", "SCH", "O/U", "SVF"
                 )
-                if any(name.startswith(x) for x in bad_starts):
+                if any(name.startswith(x) for x in bad_prefix):
                     continue
 
-                # Parse times
                 start_t = datetime.strptime(start_s, "%I:%M%p").time()
                 end_t   = datetime.strptime(end_s, "%I:%M%p").time()
 
                 start_dt = datetime.combine(current_date, start_t)
                 end_dt   = datetime.combine(current_date, end_t)
-
-                # Overnight fix
                 if end_dt <= start_dt:
-                    end_dt += timedelta(days=1)
+                    end_dt += timedelta(days=1)  # overnight
 
                 rows.append({"date": current_date, "name": name, "start_dt": start_dt, "end_dt": end_dt})
 
     return pd.DataFrame(rows)
 
-def compute_overlap_yes_only(by_date: dict, names: list[str]) -> pd.DataFrame:
-    names = [norm_name(n) for n in names if n]
+def overlap_days(by_date: dict, names: list[str], require_k: int = 3) -> pd.DataFrame:
+    """
+    Returns only YES days.
+    require_k = 3 means all 3 must overlap.
+    require_k = 2 means any 2 of them overlap (optional mode).
+    """
+    names = [clean_name(n) for n in names if n]
     uniq = list(dict.fromkeys(names))
     if len(uniq) < 3:
         return pd.DataFrame()
 
-    need = set(uniq)
     out = []
 
     for d in sorted(by_date.keys()):
-        per = by_date[d]
+        per = by_date[d]  # index = name, cols start_dt/end_dt
 
-        # Must have ALL selected employees that day
-        if not need.issubset(per.index):
+        # only consider selected people who exist that date
+        present = [n for n in uniq if n in per.index]
+        if len(present) < require_k:
             continue
 
-        sub = per.loc[uniq]
-        latest_start = sub["start_dt"].max()
-        earliest_end = sub["end_dt"].min()
+        # if require_k == len(uniq), require all selected present
+        # else check combinations of size require_k
+        if require_k == len(uniq):
+            groups = [present]  # all
+        else:
+            # small list -> brute force combos is fine
+            import itertools
+            groups = list(itertools.combinations(present, require_k))
 
-        if latest_start < earliest_end:
+        best = None  # (latest_start, earliest_end, group)
+        for group in groups:
+            sub = per.loc[list(group)]
+            latest_start = sub["start_dt"].max()
+            earliest_end = sub["end_dt"].min()
+            if latest_start < earliest_end:
+                # keep the longest overlap
+                dur = (earliest_end - latest_start).total_seconds()
+                if (best is None) or (dur > (best[1] - best[0]).total_seconds()):
+                    best = (latest_start, earliest_end, group)
+
+        if best:
+            latest_start, earliest_end, group = best
             out.append({
                 "Day/Date": datetime.combine(d, datetime.min.time()).strftime("%a %m/%d/%Y"),
                 "Common time": f"{latest_start.strftime('%-I:%M %p')} - {earliest_end.strftime('%-I:%M %p')}",
-                "Duration (hrs)": round((earliest_end - latest_start).total_seconds()/3600, 2)
+                "Duration (hrs)": round((earliest_end - latest_start).total_seconds()/3600, 2),
+                "Who overlapped": ", ".join(group)
             })
 
     return pd.DataFrame(out)
 
 st.title("Shift Overlap Finder")
-st.caption("Upload the schedule PDF, select 3+ employees, and see ONLY the days/times they overlap. (Ignores meal/skills automatically)")
+st.caption("Upload schedule PDF → select 3+ employees → see ONLY the days they overlap. (Ignores meal/skills)")
 
 pdf = st.file_uploader("Upload schedule PDF", type=["pdf"])
 if not pdf:
@@ -127,10 +153,10 @@ with st.spinner("Reading PDF..."):
     df = parse_pdf(pdf.read())
 
 if df.empty:
-    st.error("No shifts detected. (If the PDF is scanned as images, it needs OCR.)")
+    st.error("No shifts detected. If the PDF is scanned as images, it needs OCR.")
     st.stop()
 
-# Precompute per-day merged shifts (earliest start + latest end) to avoid counting meal/skills
+# Precompute merged daily shift per person: earliest start + latest end
 by_date = {}
 for d, g in df.groupby("date"):
     per = g.groupby("name").agg(start_dt=("start_dt","min"), end_dt=("end_dt","max"))
@@ -144,22 +170,29 @@ n1 = c1.selectbox("Employee 1", names_all)
 n2 = c2.selectbox("Employee 2", names_all)
 n3 = c3.selectbox("Employee 3", names_all)
 
-extra = st.multiselect("Optional: add more employees", [n for n in names_all if n not in {n1, n2, n3}])
+extra = st.multiselect(
+    "Optional: add more employees",
+    [n for n in names_all if n not in {n1, n2, n3}]
+)
+
 selected = [n1, n2, n3] + extra
 
-res = compute_overlap_yes_only(by_date, selected)
+# Optional: if boss tries 3 people that truly never overlap, app can still be useful
+mode = st.radio("Overlap requirement", ["All selected (strict)", "Any 2 of them (backup)"], horizontal=True)
+require_k = len([x for x in selected if x]) if mode == "All selected (strict)" else 2
+
+res = overlap_days(by_date, selected, require_k=require_k)
 
 st.subheader("Overlap Results (YES days only)")
 if res.empty:
-    st.warning("No days found where ALL selected employees overlap.")
+    st.warning("No overlap days found with the current selection.")
 else:
     st.dataframe(res, use_container_width=True)
     csv = res.to_csv(index=False).encode("utf-8")
     st.download_button("Download Results (CSV)", data=csv, file_name="overlap_results.csv", mime="text/csv")
 
-with st.expander("Debug (optional): counts + first 50 shifts"):
+with st.expander("Debug (optional)"):
     st.caption(f"Shifts read: {len(df)} | Dates: {df['date'].nunique()} | Employees: {df['name'].nunique()}")
-    show = df.sort_values(["date","name"]).head(50).copy()
-    show["start"] = show["start_dt"].dt.strftime("%m/%d %I:%M %p")
-    show["end"] = show["end_dt"].dt.strftime("%m/%d %I:%M %p")
-    st.dataframe(show[["date","name","start","end"]], use_container_width=True)
+    # Show a few names to confirm they look clean (no leading dots)
+    st.write("Example employee names detected:")
+    st.write(df["name"].drop_duplicates().head(25).tolist())
